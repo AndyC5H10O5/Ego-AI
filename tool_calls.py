@@ -43,7 +43,7 @@ def read_assistant(stream) -> dict:
             raise RuntimeError("Incomplete tool-call stream.")
         message["tool_calls"] = [calls[i] for i in sorted(calls)]
     elif finish not in ("stop", "length") or (finish == "length" and not message["content"].strip()):
-        raise RuntimeError("Incomplete self-dialogue stream.")
+        raise RuntimeError("Incomplete internal thought stream.")
     return message
 
 
@@ -65,7 +65,7 @@ def execute_calls(assistant: dict, incoming: str, count_tokens) -> ToolStep:
         memory.append(incoming)
     messages.append(assistant)
     if assistant["content"]:
-        memory.append("【自我对话】\n" + assistant["content"])
+        memory.append("【脑内思考】\n" + assistant["content"])
     for call in assistant["tool_calls"]:
         name = call["function"]["name"]
         raw = call["function"]["arguments"]

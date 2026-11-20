@@ -19,4 +19,4 @@ def speak(text: str) -> str:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("text 必须是非空字符串")
     print(text, flush=True)
-    return "已向用户说出这段话。"
+    return "tool_calls=1"

@@ -56,7 +56,7 @@ def env_float(name: str, default: float) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Continuous DeepSeek self-dialogue with optional live user input."
+        description="Continuous internal thought with DeepSeek and optional live user input."
     )
     parser.add_argument(
         "--context-window", type=int, default=env_int("CONTEXT_WINDOW_TOKENS", 1048576),
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--round-interval", type=float, default=os.getenv("ROUND_INTERVAL_SECONDS") or 0.5,
-        help="Seconds to pause between self-dialogue rounds (default: %(default)s, 0 disables).",
+        help="Seconds to pause between internal thought rounds (default: %(default)s, 0 disables).",
     )
     parser.add_argument(
         "--max-chars",
@@ -231,7 +231,7 @@ def main() -> int:
     previous_round = round_index
     run_log_file = prepare_log_file(args.log_file, model)
 
-    print("DeepSeek self-loop started. Type a line and press Enter to add input. Ctrl+C to stop.", file=sys.stderr)
+    print("DeepSeek internal thought loop started. Type a line and press Enter to add input. Ctrl+C to stop.", file=sys.stderr)
     print(f"Model: {model}", file=sys.stderr)
     print(f"Log file: {os.path.abspath(run_log_file)}", file=sys.stderr)
 
@@ -284,7 +284,7 @@ def main() -> int:
                     body = join_sections(history, latest)
                     if not steps:
                         body = join_sections(body, pending)
-                    messages = context.messages(join_sections(body or "【自我对话】", clock_note))
+                    messages = context.messages(join_sections(body or "【脑内思考】", clock_note))
                     for step in steps:
                         messages.extend(step.messages)
                     if steps and pending:
@@ -348,7 +348,7 @@ def main() -> int:
                 tool_results = step.results
             else:
                 history = join_sections(history, latest, *(step.memory for step in steps), pending)
-                latest = "【自我对话】\n" + dated_answer
+                latest = "【脑内思考】\n" + dated_answer
                 steps.clear()
             append_log(run_log_file, round_index, round_output, assistant.get("reasoning_content", ""),
                        elapsed, pending, timestamp, tool_results)
