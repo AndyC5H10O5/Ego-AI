@@ -1,4 +1,5 @@
 import gzip
+import sys
 from pathlib import Path
 
 from openai import OpenAI
@@ -23,7 +24,7 @@ def join_sections(*sections: str) -> str:
 
 
 class ContextWindow:
-    def __init__(self, fixed: str, window: int, output: int):
+    def __init__(self, fixed: str, window: int, output: int, tool_schema: str = ""):
         # Official offline tokenizer from cdn.deepseek.com/api-docs/deepseek_v4_tokenizer.zip
         with gzip.open(ROOT / "tokenizers_data/deepseek_v4.json.gz", "rt", encoding="utf-8") as f:
             self.tokenizer = Tokenizer.from_str(f.read())
@@ -36,9 +37,10 @@ class ContextWindow:
             "用第一人称把它们合成一份可独立使用的记忆，区分用户原话和自己的判断。"
             "保留最重要的信息和未完成的思路，只输出完整摘要。"
         )
-        # Both requests use exactly two messages. Leave room for chat template tokens.
+        # Summary requests use two messages. Dialogue also carries tool definitions
+        # and may reserve more space for a pending assistant/tool exchange.
         self.input_limit = window - self.count(fixed) - 32
-        self.turn_limit = self.input_limit - output
+        self.turn_limit = self.input_limit - output - self.count(tool_schema)
         if output <= 0 or self.memory_limit <= 0 or min(
             self.turn_limit - self.memory_limit,
             self.input_limit - self.count(self.summary_instruction) - 2 * self.memory_limit,
@@ -84,15 +86,17 @@ class ContextWindow:
         return memory
 
     def fit(
-        self, client: OpenAI, model: str, history: str, latest: str, incoming: str
+        self, client: OpenAI, model: str, history: str, latest: str, incoming: str,
+        reserved: int = 0,
     ) -> tuple[str, str, str]:
-        if self.count(join_sections(history, latest, incoming)) <= self.turn_limit:
+        turn_limit = self.turn_limit - reserved
+        if self.count(join_sections(history, latest, incoming)) <= turn_limit:
             return history, latest, incoming
 
-        print("[Memory] Compressing context...", flush=True)
+        print("[Memory] Compressing context...", file=sys.stderr, flush=True)
         # The retained previous output shares the 20% history budget with the summary.
         # New user input stays verbatim whenever it fits beside that memory.
-        room = min(self.memory_limit, self.turn_limit - self.count(incoming) - 4)
+        room = min(self.memory_limit, turn_limit - self.count(incoming) - 4)
         label = "【压缩记忆】\n"
         available = room - self.count(join_sections(label, latest)) - 4
         if available < 64:
@@ -103,7 +107,7 @@ class ContextWindow:
         else:
             # An exceptionally large user input also needs compression. Both summaries
             # share one memory budget and keep their different origins visible.
-            remaining = self.memory_limit - self.count("【用户输入】\n") - 4
+            remaining = min(self.memory_limit, turn_limit) - self.count("【用户输入】\n") - 4
             if history:
                 history = label + self.summarize(client, model, history, remaining // 2)
                 remaining -= self.count(history) + 4

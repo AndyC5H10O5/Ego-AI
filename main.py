@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import sys
@@ -11,6 +12,7 @@ from typing import Optional
 from openai import AuthenticationError, BadRequestError, OpenAI
 
 from context_window import ROOT, ContextWindow, join_sections, load_fixed_prompt
+from tool_calls import TOOL_SCHEMAS, ToolStep, execute_calls, read_assistant
 
 
 def configure_output_encoding() -> None:
@@ -18,15 +20,6 @@ def configure_output_encoding() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8", errors="replace")
-
-
-def safe_stream_print(text: str) -> None:
-    try:
-        print(text, end="", flush=True)
-    except UnicodeEncodeError:
-        encoded = text.encode("utf-8", errors="replace")
-        sys.stdout.buffer.write(encoded)
-        sys.stdout.buffer.flush()
 
 
 def load_dotenv_if_exists(path: str = ".env") -> None:
@@ -117,43 +110,16 @@ def get_client() -> tuple[OpenAI, str]:
     return client, model
 
 
-def stream_once(client: OpenAI, model: str, context: ContextWindow, body: str) -> tuple[str, str]:
-    response_stream = client.chat.completions.create(
+def stream_once(client: OpenAI, model: str, messages: list[dict], output_tokens: int) -> dict:
+    with client.chat.completions.create(
         model=model,
-        messages=context.messages(body),
-        max_tokens=context.output,
+        messages=messages,
+        tools=TOOL_SCHEMAS,
+        tool_choice="auto",
+        max_tokens=output_tokens,
         stream=True,
-    )
-
-    reasoning_started = False
-    answer_started = False
-    reasoning_chunks: list[str] = []
-    chunks: list[str] = []
-    for event in response_stream:
-        if not event.choices:
-            continue
-        delta = event.choices[0].delta
-        if not delta:
-            continue
-
-        reasoning_text = getattr(delta, "reasoning_content", None)
-        if reasoning_text:
-            if not reasoning_started:
-                print("[Thinking]")
-                reasoning_started = True
-            reasoning_chunks.append(reasoning_text)
-            safe_stream_print(reasoning_text)
-
-        text = delta.content
-        if text:
-            if not answer_started:
-                if reasoning_started:
-                    print("\n[Answer]")
-                answer_started = True
-            chunks.append(text)
-            safe_stream_print(text)
-
-    return "".join(chunks), "".join(reasoning_chunks)
+    ) as stream:
+        return read_assistant(stream)
 
 
 def prepare_log_file(log_file: str, model: str) -> str:
@@ -173,7 +139,8 @@ def prepare_log_file(log_file: str, model: str) -> str:
 
 
 def append_log(
-    log_file: str, round_index: int, answer: str, reasoning: str, elapsed: float, user_input: str
+    log_file: str, round_index: int, answer: str, reasoning: str, elapsed: float, user_input: str,
+    tool_results: str = "",
 ) -> None:
     with open(log_file, "a", encoding="utf-8") as file:
         file.write(
@@ -189,6 +156,8 @@ def append_log(
         file.write("[Answer]\n")
         file.write(answer)
         file.write("\n\n")
+        if tool_results:
+            file.write(tool_results + "\n\n")
 
 
 def read_user_input(inbox: SimpleQueue) -> None:
@@ -217,7 +186,8 @@ def main() -> int:
         output = args.max_output_tokens
         if output is None:
             output = min(65536, args.context_window // 4)
-        context = ContextWindow(load_fixed_prompt(), args.context_window, output)
+        tool_schema = json.dumps(TOOL_SCHEMAS, ensure_ascii=False)
+        context = ContextWindow(load_fixed_prompt(), args.context_window, output, tool_schema)
         if args.max_retries < 0 or args.retry_delay < 0:
             raise ValueError("Retry count and delay must be nonnegative.")
     except Exception as exc:
@@ -227,42 +197,65 @@ def main() -> int:
     history = ""
     latest = ""
     pending = ""
+    steps: list[ToolStep] = []
     inbox = SimpleQueue()
     Thread(target=read_user_input, args=(inbox,), daemon=True).start()
-    round_index = 0
+    round_index = 1
     run_log_file = prepare_log_file(args.log_file, model)
 
-    print("DeepSeek self-loop started. Type a line and press Enter to add input. Ctrl+C to stop.")
-    print(f"Model: {model}")
-    print(f"Log file: {os.path.abspath(run_log_file)}")
-    print("-" * 72)
+    print("DeepSeek self-loop started. Type a line and press Enter to add input. Ctrl+C to stop.", file=sys.stderr)
+    print(f"Model: {model}", file=sys.stderr)
+    print(f"Log file: {os.path.abspath(run_log_file)}", file=sys.stderr)
 
     try:
         while True:
-            round_index += 1
             if args.max_rounds is not None and round_index > args.max_rounds:
-                print(f"\nReached max rounds ({args.max_rounds}). Exiting.")
+                print(f"\nReached max rounds ({args.max_rounds}). Exiting.", file=sys.stderr)
                 break
 
             attempt = 0
-            round_output = ""
-            round_reasoning = ""
+            assistant = None
             start_time = time.perf_counter()
 
             while attempt <= args.max_retries:
                 try:
+                    # Fold completed tool steps into ordinary memory only when the wire
+                    # transcript itself would crowd out the next request.
+                    reserved = sum(step.tokens for step in steps)
+                    while len(steps) > 1 and reserved > context.turn_limit - 128:
+                        oldest = steps.pop(0)
+                        history = join_sections(history, latest, oldest.memory)
+                        latest = ""
+                        reserved -= oldest.tokens
+                    # A large final tool call still needs its receipt delivered. Borrow
+                    # from the completion allowance before compacting that last step.
+                    borrowed = max(0, reserved + 128 - context.turn_limit) if steps else 0
+                    if steps and borrowed >= context.output:
+                        history = join_sections(history, latest, steps.pop().memory)
+                        latest = ""
+                        reserved = borrowed = 0
+                    output_tokens = context.output - borrowed
+
                     pending = join_sections(pending, take_user_input(inbox))
-                    history, latest, pending = context.fit(client, model, history, latest, pending)
-                    # Lines submitted during compression belong to the imminent turn too.
-                    while new_input := take_user_input(inbox):
+                    while True:
+                        history, latest, pending = context.fit(
+                            client, model, history, latest, pending, reserved - borrowed
+                        )
+                        new_input = take_user_input(inbox)
+                        if not new_input:
+                            break
                         pending = join_sections(pending, new_input)
-                        history, latest, pending = context.fit(client, model, history, latest, pending)
-                    body = join_sections(history, latest, pending) or "【自我对话】"
-                    print(f"\n[Round {round_index}] input_chars={len(body)}")
-                    round_output, round_reasoning = stream_once(client, model, context, body)
-                    if round_output.strip():
-                        break
-                    raise RuntimeError("Empty output received from API stream.")
+
+                    body = join_sections(history, latest)
+                    if not steps:
+                        body = join_sections(body, pending)
+                    messages = context.messages(body or "【自我对话】")
+                    for step in steps:
+                        messages.extend(step.messages)
+                    if steps and pending:
+                        messages.append({"role": "user", "content": pending})
+                    assistant = stream_once(client, model, messages, output_tokens)
+                    break
                 except AuthenticationError:
                     print("DeepSeek authentication failed. Check DEEPSEEK_API_KEY.", file=sys.stderr)
                     return 1
@@ -272,7 +265,7 @@ def main() -> int:
                     limit = int(match[1].replace(",", "")) if match else 0
                     if 0 < limit < context.window:
                         try:
-                            context = ContextWindow(context.fixed, limit, min(context.output, limit // 4))
+                            context = ContextWindow(context.fixed, limit, min(context.output, limit // 4), tool_schema)
                         except ValueError as error:
                             print(f"Configuration error: {error}", file=sys.stderr)
                             return 1
@@ -292,29 +285,40 @@ def main() -> int:
                         f"\n[Round {round_index}] attempt {attempt}/{args.max_retries} failed: {exc}",
                         file=sys.stderr,
                     )
-                    print(f"[Round {round_index}] retrying in {args.retry_delay:.1f}s...")
+                    print(f"[Round {round_index}] retrying in {args.retry_delay:.1f}s...", file=sys.stderr)
                     time.sleep(args.retry_delay)
 
-            if not round_output.strip():
+            if assistant is None:
+                round_index += 1
                 continue
             elapsed = time.perf_counter() - start_time
-            print(
-                f"\n[Round {round_index} completed] output_chars={len(round_output)} elapsed_s={elapsed:.2f}"
-            )
-
+            round_output = assistant["content"]
             if args.max_chars is not None and len(round_output) > args.max_chars:
-                print(
-                    f"[Round {round_index}] output exceeded max chars ({args.max_chars}). Exiting."
-                )
+                print(f"[Round {round_index}] output exceeded max chars. Exiting.", file=sys.stderr)
                 break
 
-            append_log(run_log_file, round_index, round_output, round_reasoning, elapsed, pending)
-            history = join_sections(history, latest, pending)
-            latest = "【自我对话】\n" + round_output
+            tool_results = ""
+            if assistant.get("tool_calls"):
+                # Only a fully received call can speak. A retry of the following request
+                # reuses these results without executing the same calls again.
+                step = execute_calls(assistant, pending if steps else "", context.count)
+                if not steps:
+                    history = join_sections(history, latest, pending)
+                    latest = ""
+                steps.append(step)
+                tool_results = step.results
+            else:
+                history = join_sections(history, latest, *(step.memory for step in steps), pending)
+                latest = "【自我对话】\n" + round_output if round_output else ""
+                steps.clear()
+            append_log(run_log_file, round_index, round_output, assistant.get("reasoning_content", ""),
+                       elapsed, pending, tool_results)
             pending = ""
+            if not assistant.get("tool_calls"):
+                round_index += 1
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user. Graceful shutdown complete.")
+        print("\nInterrupted by user. Graceful shutdown complete.", file=sys.stderr)
         return 0
 
     return 0
