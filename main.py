@@ -1,4 +1,5 @@
 import argparse
+import codecs
 import json
 import os
 import re
@@ -161,9 +162,27 @@ def append_log(
 
 
 def read_user_input(inbox: SimpleQueue) -> None:
-    for line in sys.stdin:
-        if line.strip():
-            inbox.put(line.rstrip("\r\n"))
+    stream = sys.stdin
+    if stream is None:
+        return
+    if hasattr(stream, "reconfigure"):
+        encoding = stream.encoding
+        peek = getattr(getattr(stream, "buffer", None), "peek", None)
+        if peek is not None and not stream.isatty():
+            # Windows IDEs and redirected files can supply a BOM even when
+            # Python has configured stdin as UTF-8. Peek without consuming text.
+            prefix = peek(4)[:4]
+            if prefix.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+                encoding = "utf-32"
+            elif prefix.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                encoding = "utf-16"
+            elif prefix.startswith(codecs.BOM_UTF8):
+                encoding = "utf-8-sig"
+        stream.reconfigure(encoding=encoding, errors="replace")
+    for line in stream:
+        line = line.rstrip("\r\n")
+        if line.replace("\ufffd", "").strip():
+            inbox.put(line)
 
 
 def take_user_input(inbox: SimpleQueue) -> str:
