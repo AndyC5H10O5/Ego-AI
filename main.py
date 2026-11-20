@@ -1,6 +1,7 @@
 import argparse
 import codecs
 import json
+import math
 import os
 import re
 import sys
@@ -72,6 +73,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum rounds before exit. Default: unlimited.",
     )
     parser.add_argument(
+        "--round-interval", type=float, default=os.getenv("ROUND_INTERVAL_SECONDS") or 0.5,
+        help="Seconds to pause between self-dialogue rounds (default: %(default)s, 0 disables).",
+    )
+    parser.add_argument(
         "--max-chars",
         type=int,
         default=env_int("MAX_CHARS", None),
@@ -94,7 +99,10 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("LOG_FILE", ""),
         help="Log file path. Empty means auto-create one file per run.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not math.isfinite(args.round_interval) or args.round_interval < 0:
+        parser.error("--round-interval must be a finite, nonnegative number of seconds")
+    return args
 
 
 def get_client() -> tuple[OpenAI, str]:
@@ -141,7 +149,7 @@ def prepare_log_file(log_file: str, model: str) -> str:
 
 def append_log(
     log_file: str, round_index: int, answer: str, reasoning: str, elapsed: float, user_input: str,
-    tool_results: str = "",
+    timestamp: str, tool_results: str = "",
 ) -> None:
     with open(log_file, "a", encoding="utf-8") as file:
         file.write(
@@ -154,7 +162,7 @@ def append_log(
             file.write("[Thinking]\n")
             file.write(reasoning)
             file.write("\n\n")
-        file.write("[Answer]\n")
+        file.write(f"[Answer]\n{timestamp}\n")
         file.write(answer)
         file.write("\n\n")
         if tool_results:
@@ -220,6 +228,7 @@ def main() -> int:
     inbox = SimpleQueue()
     Thread(target=read_user_input, args=(inbox,), daemon=True).start()
     round_index = 1
+    previous_round = round_index
     run_log_file = prepare_log_file(args.log_file, model)
 
     print("DeepSeek self-loop started. Type a line and press Enter to add input. Ctrl+C to stop.", file=sys.stderr)
@@ -232,6 +241,12 @@ def main() -> int:
                 print(f"\nReached max rounds ({args.max_rounds}). Exiting.", file=sys.stderr)
                 break
 
+            if round_index != previous_round and args.round_interval:
+                time.sleep(args.round_interval)
+            previous_round = round_index
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            clock_note = f"【当前时间】{timestamp}"
+            clock_tokens = context.count("\n\n" + clock_note)
             attempt = 0
             assistant = None
             start_time = time.perf_counter()
@@ -241,14 +256,15 @@ def main() -> int:
                     # Fold completed tool steps into ordinary memory only when the wire
                     # transcript itself would crowd out the next request.
                     reserved = sum(step.tokens for step in steps)
-                    while len(steps) > 1 and reserved > context.turn_limit - 128:
+                    turn_limit = context.turn_limit - clock_tokens
+                    while len(steps) > 1 and reserved > turn_limit - 128:
                         oldest = steps.pop(0)
                         history = join_sections(history, latest, oldest.memory)
                         latest = ""
                         reserved -= oldest.tokens
                     # A large final tool call still needs its receipt delivered. Borrow
                     # from the completion allowance before compacting that last step.
-                    borrowed = max(0, reserved + 128 - context.turn_limit) if steps else 0
+                    borrowed = max(0, reserved + 128 - turn_limit) if steps else 0
                     if steps and borrowed >= context.output:
                         history = join_sections(history, latest, steps.pop().memory)
                         latest = ""
@@ -258,7 +274,7 @@ def main() -> int:
                     pending = join_sections(pending, take_user_input(inbox))
                     while True:
                         history, latest, pending = context.fit(
-                            client, model, history, latest, pending, reserved - borrowed
+                            client, model, history, latest, pending, reserved - borrowed + clock_tokens
                         )
                         new_input = take_user_input(inbox)
                         if not new_input:
@@ -268,7 +284,7 @@ def main() -> int:
                     body = join_sections(history, latest)
                     if not steps:
                         body = join_sections(body, pending)
-                    messages = context.messages(body or "【自我对话】")
+                    messages = context.messages(join_sections(body or "【自我对话】", clock_note))
                     for step in steps:
                         messages.extend(step.messages)
                     if steps and pending:
@@ -317,9 +333,13 @@ def main() -> int:
                 break
 
             tool_results = ""
+            # Only the private answer gets the time prefix. Tool arguments and
+            # character limits continue to use the model's original text.
+            dated_answer = f"{timestamp}\n{round_output}" if round_output else timestamp
             if assistant.get("tool_calls"):
                 # Only a fully received call can speak. A retry of the following request
                 # reuses these results without executing the same calls again.
+                assistant["content"] = dated_answer
                 step = execute_calls(assistant, pending if steps else "", context.count)
                 if not steps:
                     history = join_sections(history, latest, pending)
@@ -328,10 +348,10 @@ def main() -> int:
                 tool_results = step.results
             else:
                 history = join_sections(history, latest, *(step.memory for step in steps), pending)
-                latest = "【自我对话】\n" + round_output if round_output else ""
+                latest = "【自我对话】\n" + dated_answer
                 steps.clear()
             append_log(run_log_file, round_index, round_output, assistant.get("reasoning_content", ""),
-                       elapsed, pending, tool_results)
+                       elapsed, pending, timestamp, tool_results)
             pending = ""
             if not assistant.get("tool_calls"):
                 round_index += 1
